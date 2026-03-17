@@ -1,0 +1,22 @@
+{
+  "name": "goai-bench-ts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench:stream": "bun run stream-bench.ts",
+    "bench:memory": "bun run memory-bench.ts",
+    "bench:schema": "bun run schema-bench.ts",
+    "bench:cold": "bun run coldstart/run.ts",
+    "bench:all": "bun run bench:stream && bun run bench:memory && bun run bench:schema && bun run bench:cold"
+  },
+  "dependencies": {
+    "@ai-sdk/amazon-bedrock": "^4.0.77",
+    "@ai-sdk/openai": "2.0.89",
+    "ai": "5.0.124",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "tinybench": "^4.0.1",
+    "@types/bun": "^1.2.5"
+  }
+}

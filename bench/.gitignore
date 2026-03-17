@@ -1,0 +1,5 @@
+results/
+ts/node_modules/
+ts/bun.lock
+go/coldstart/coldstart
+go/bench.test
