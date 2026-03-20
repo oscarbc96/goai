@@ -17,6 +17,8 @@ export default defineConfig({
     ['meta', { property: 'og:description', content: 'AI SDK, the Go way.' }],
     ['meta', { property: 'og:image', content: '/goai.png' }],
     ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
+    ['script', { async: '', src: 'https://www.googletagmanager.com/gtag/js?id=G-0H3DYJ0C2H' }],
+    ['script', {}, "window.dataLayer = window.dataLayer || [];\nfunction gtag(){dataLayer.push(arguments);}\ngtag('js', new Date());\ngtag('config', 'G-0H3DYJ0C2H');"],
   ],
 
   themeConfig: {
