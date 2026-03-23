@@ -12,21 +12,31 @@ const current = ref("latest");
 const latestTag = ref("");
 const branchBaseURL = ref("");
 
+// Detect if we're on a branch deploy by matching CF Pages branch subdomain.
+// Branch deploys: v0-4-2.goai-2lz.pages.dev → version "v0.4.2"
+function detectBranchVersion(): string | null {
+  const host = window.location.hostname;
+  const match = host.match(/^(v[\d-]+)\./);
+  if (match) {
+    return match[1].replace(/-/g, ".");
+  }
+  return null;
+}
+
 onMounted(async () => {
   try {
-    const base = import.meta.env.BASE_URL || "/";
-    const res = await fetch(`${base}versions.json`);
+    // Always fetch from canonical source to get consistent version data.
+    const res = await fetch("https://goai.sh/versions.json");
     if (res.ok) {
       const data = await res.json();
       versions.value = data.versions || [];
       latestTag.value = data.latest || "";
       branchBaseURL.value = data.branchBaseURL || "";
 
-      // Detect current version from URL path (e.g. /v0.4.0/getting-started/)
-      const path = window.location.pathname;
-      const match = path.match(/^\/(v[\d.]+)\//);
-      if (match) {
-        current.value = match[1];
+      // Detect current version from branch deploy hostname.
+      const branchVer = detectBranchVersion();
+      if (branchVer) {
+        current.value = branchVer;
       }
     }
   } catch {
@@ -36,25 +46,13 @@ onMounted(async () => {
 
 function navigate(tag: string) {
   const path = window.location.pathname;
-  // Strip current version prefix from path
-  const stripped = path.replace(/^\/(v[\d.]+)\//, "/");
   if (tag === "latest") {
-    if (branchBaseURL.value) {
-      // On a branch deploy, go back to main site
-      window.location.href = "https://goai.sh" + stripped;
-    } else {
-      window.location.href = stripped;
-    }
+    window.location.href = "https://goai.sh" + path;
   } else {
-    // Navigate to versioned branch deploy
     // CF Pages branch names use dashes: v0.4.2 → v0-4-2
     const branch = tag.replace(/\./g, "-");
-    if (branchBaseURL.value) {
-      const url = branchBaseURL.value.replace("{branch}", branch);
-      window.location.href = url + stripped;
-    } else {
-      window.location.href = "/" + tag + stripped;
-    }
+    const url = branchBaseURL.value.replace("{branch}", branch);
+    window.location.href = url + path;
   }
 }
 </script>
