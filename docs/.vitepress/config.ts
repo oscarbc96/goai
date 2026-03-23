@@ -82,6 +82,7 @@ export default defineConfig({
 
     nav: [
       { text: 'Guide', link: '/getting-started/installation' },
+      { text: 'Architecture', link: '/architecture' },
       { text: 'Providers', link: '/providers/' },
       { text: 'API', link: '/api/core-functions' },
       { text: 'Examples', link: '/examples' },
