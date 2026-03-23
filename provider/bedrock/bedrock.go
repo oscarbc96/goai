@@ -223,10 +223,26 @@ func (m *chatModel) readIDRegion() (string, string) {
 func (m *chatModel) Capabilities() provider.ModelCapabilities {
 	return provider.ModelCapabilities{
 		Temperature:      true,
-		ToolCall:         true,
+		ToolCall:         modelSupportsTools(m.id),
 		InputModalities:  provider.ModalitySet{Text: true, Image: true},
 		OutputModalities: provider.ModalitySet{Text: true},
 	}
+}
+
+// modelSupportsTools returns whether a Bedrock model supports tool_use.
+// DeepSeek R1 and Titan Text Lite/Express do not support tool calling.
+func modelSupportsTools(modelID string) bool {
+	lower := strings.ToLower(modelID)
+	// DeepSeek R1 (reasoning model) does not support tool_use on Bedrock.
+	// DeepSeek V3 DOES support tool_use.
+	if strings.Contains(lower, "deepseek") && strings.Contains(lower, "r1") {
+		return false
+	}
+	// Amazon Titan Text Lite and Express do not support tool_use.
+	if strings.Contains(lower, "titan-text-lite") || strings.Contains(lower, "titan-text-express") {
+		return false
+	}
+	return true
 }
 
 const responseFormatToolName = "__json_response"
@@ -429,6 +445,12 @@ func (m *chatModel) buildAndSend(ctx context.Context, params provider.GeneratePa
 	m.applyBedrockOptions(body, params.Tools, params.ProviderOptions)
 	if len(params.Tools) == 0 {
 		delete(body, "toolConfig")
+		// Bedrock Converse API requires toolConfig whenever messages contain
+		// toolUse or toolResult content blocks. This happens after Esc interrupt:
+		// conversation history retains tool blocks from the aborted turn, but
+		// the new request may not include tools (e.g., compaction agent).
+		// Scan messages and synthesize a minimal toolConfig from referenced tools.
+		ensureToolConfigForHistory(body, params.Messages)
 	}
 	return m.doHTTP(ctx, body, streaming)
 }
