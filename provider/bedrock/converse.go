@@ -155,6 +155,51 @@ func buildConverseRequest(params provider.GenerateParams, modelID string) map[st
 	return body
 }
 
+// ensureToolConfigForHistory scans provider messages for toolUse/toolResult
+// references and synthesizes a minimal toolConfig in the request body.
+// This is required because Bedrock Converse API returns an error when messages
+// contain toolUse or toolResult content blocks but toolConfig is absent.
+//
+// This scenario occurs after an Esc interrupt: the conversation history
+// retains tool blocks from the aborted turn, and if the subsequent request
+// has no tools (e.g., compaction agent, or a retry without tools), Bedrock
+// rejects it. The fix creates placeholder tool definitions from the tool
+// names found in the message history.
+func ensureToolConfigForHistory(body map[string]any, msgs []provider.Message) {
+	// Already has toolConfig - nothing to do.
+	if _, ok := body["toolConfig"]; ok {
+		return
+	}
+
+	// Scan messages for tool-call parts to extract tool names.
+	toolNames := make(map[string]bool)
+	for _, msg := range msgs {
+		for _, p := range msg.Content {
+			if p.Type == provider.PartToolCall && p.ToolName != "" {
+				toolNames[p.ToolName] = true
+			}
+		}
+	}
+
+	if len(toolNames) == 0 {
+		return
+	}
+
+	// Build minimal toolConfig with placeholder tool definitions.
+	// Bedrock requires name + description + inputSchema for each tool.
+	tools := make([]map[string]any, 0, len(toolNames))
+	for name := range toolNames {
+		tools = append(tools, map[string]any{
+			"toolSpec": map[string]any{
+				"name":        name,
+				"description": name,
+				"inputSchema": map[string]any{"json": map[string]any{"type": "object"}},
+			},
+		})
+	}
+	body["toolConfig"] = map[string]any{"tools": tools}
+}
+
 // convertMessages maps provider.Message slice to Bedrock Converse format.
 // Tool-role messages are merged into user role per Bedrock convention.
 func convertMessages(msgs []provider.Message) []map[string]any {

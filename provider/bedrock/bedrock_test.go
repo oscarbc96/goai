@@ -4119,3 +4119,104 @@ func TestDoStream_ToolStreamingRetry_DrainCtxDone(t *testing.T) {
 	for range result.Stream {
 	}
 }
+
+func TestModelSupportsTools(t *testing.T) {
+	tests := []struct {
+		modelID string
+		want    bool
+	}{
+		{"anthropic.claude-sonnet-4-20250514-v1:0", true},
+		{"anthropic.claude-3-5-haiku-20241022-v1:0", true},
+		{"deepseek.r1-v1:0", false},
+		{"deepseek.v3-v1:0", true},
+		{"deepseek.v3.2", true},
+		{"amazon.titan-text-lite-v1", false},
+		{"amazon.titan-text-express-v1", false},
+		{"amazon.nova-pro-v1:0", true},
+		{"meta.llama3-2-90b-instruct-v1:0", true},
+		{"us.deepseek.r1-v1:0", false},
+		{"us.deepseek.v3-v1:0", true},
+	}
+	for _, tt := range tests {
+		got := modelSupportsTools(tt.modelID)
+		if got != tt.want {
+			t.Errorf("modelSupportsTools(%q) = %v, want %v", tt.modelID, got, tt.want)
+		}
+	}
+}
+
+func TestCapabilities_PerModel(t *testing.T) {
+	m := Chat("deepseek.r1-v1:0").(*chatModel)
+	caps := m.Capabilities()
+	if caps.ToolCall {
+		t.Error("deepseek.r1-v1:0 should have ToolCall=false")
+	}
+	m2 := Chat("deepseek.v3-v1:0").(*chatModel)
+	caps2 := m2.Capabilities()
+	if !caps2.ToolCall {
+		t.Error("deepseek.v3-v1:0 should have ToolCall=true")
+	}
+}
+
+func TestEnsureToolConfigForHistory_NoToolBlocks(t *testing.T) {
+	body := map[string]any{}
+	msgs := []provider.Message{
+		{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hello"}}},
+	}
+	ensureToolConfigForHistory(body, msgs)
+	if _, ok := body["toolConfig"]; ok {
+		t.Error("should not add toolConfig when no tool blocks")
+	}
+}
+
+func TestEnsureToolConfigForHistory_WithToolBlocks(t *testing.T) {
+	body := map[string]any{}
+	msgs := []provider.Message{
+		{Role: provider.RoleAssistant, Content: []provider.Part{
+			{Type: provider.PartToolCall, ToolName: "bash", ToolCallID: "1"},
+		}},
+	}
+	ensureToolConfigForHistory(body, msgs)
+	tc, ok := body["toolConfig"]
+	if !ok {
+		t.Fatal("should add toolConfig when tool blocks present")
+	}
+	tools := tc.(map[string]any)["tools"].([]map[string]any)
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 tool, got %d", len(tools))
+	}
+	spec := tools[0]["toolSpec"].(map[string]any)
+	if spec["name"] != "bash" {
+		t.Errorf("expected tool name 'bash', got %v", spec["name"])
+	}
+}
+
+func TestEnsureToolConfigForHistory_SkipsIfExists(t *testing.T) {
+	body := map[string]any{"toolConfig": map[string]any{"tools": []any{}}}
+	msgs := []provider.Message{
+		{Role: provider.RoleAssistant, Content: []provider.Part{
+			{Type: provider.PartToolCall, ToolName: "bash", ToolCallID: "1"},
+		}},
+	}
+	ensureToolConfigForHistory(body, msgs)
+	tools := body["toolConfig"].(map[string]any)["tools"].([]any)
+	if len(tools) != 0 {
+		t.Error("should not modify existing toolConfig")
+	}
+}
+
+func TestEnsureToolConfigForHistory_MultipleTools(t *testing.T) {
+	body := map[string]any{}
+	msgs := []provider.Message{
+		{Role: provider.RoleAssistant, Content: []provider.Part{
+			{Type: provider.PartToolCall, ToolName: "bash", ToolCallID: "1"},
+			{Type: provider.PartToolCall, ToolName: "read", ToolCallID: "2"},
+			{Type: provider.PartToolCall, ToolName: "bash", ToolCallID: "3"},
+		}},
+	}
+	ensureToolConfigForHistory(body, msgs)
+	tools := body["toolConfig"].(map[string]any)["tools"].([]map[string]any)
+	if len(tools) != 2 {
+		t.Fatalf("expected 2 unique tools, got %d", len(tools))
+	}
+}
