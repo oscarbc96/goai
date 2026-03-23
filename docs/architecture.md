@@ -121,13 +121,14 @@ Providers fall into two categories:
 
 These providers implement their own request/response codec because their APIs differ significantly from OpenAI:
 
-| Provider      | API                              | Key Differences                                                                                                                                                                                                                         |
-| ------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **OpenAI**    | Chat Completions + Responses API | Dual API routing: Responses API (default for all models), Chat Completions (opt-in via `useResponsesAPI: false`). Provider-defined tools: web search, code interpreter, file search, image generation.                                  |
-| **Anthropic** | Messages API                     | Custom SSE event format (`message_start`, `content_block_start`, `content_block_delta`, etc.). Structured output via tool trick or native `output_format`. Provider-defined tools: computer use, web search, code execution, web fetch. |
-| **Google**    | Gemini REST API                  | Custom JSON format with `contents[]` array, `generationConfig`, `tools[]`. Provider-defined tools: Google Search grounding, URL context, code execution.                                                                                |
-| **Bedrock**   | AWS Converse API                 | Binary EventStream protocol for streaming, SigV4 request signing (implemented without AWS SDK), cross-region inference fallback with `us.` prefix retry.                                                                                |
-| **Cohere**    | Chat v2 + Embed API              | Custom message format, tool results as `tool_content` parts, native embed API.                                                                                                                                                          |
+| Provider      | API                              | Key Differences                                                                                                                                                                                                                                                                                    |
+| ------------- | -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **OpenAI**    | Chat Completions + Responses API | **Complex routing**: o3/gpt-5+/codex models → Responses API only; others → Responses API default, Chat Completions override (`useResponsesAPI: false`). Separate `responses.go` handles different SSE format. Provider-defined tools: web search, code interpreter, file search, image generation. |
+| ------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------                                                             |
+| **Anthropic** | Messages API                     | Custom SSE event format (`message_start`, `content_block_start`, `content_block_delta`, etc.). Structured output via tool trick (injects synthetic tool) or native `output_format`. Provider-defined tools: computer use, web search, code execution, web fetch.                                   |
+| **Google**    | Gemini REST API                  | Custom JSON format with `contents[]` array, `generationConfig`, `tools[]`. Structured output via `responseMimeType` + `responseSchema` in `tools[]`. Provider-defined tools: Google Search grounding, URL context, code execution.                                                                 |
+| **Bedrock**   | AWS Converse API                 | Binary EventStream protocol for streaming, SigV4 request signing (without AWS SDK), cross-region inference fallback with `us.` prefix retry.                                                                                                                                                       |
+| **Cohere**    | Chat v2 + Embed API              | Custom message format (`tool_content` parts for tool results), native embed API. Structured output via tool trick adaptation.                                                                                                                                                                      |
 
 ### OpenAI-Compatible Providers (shared codec)
 
@@ -281,7 +282,7 @@ Token(ctx) called
   └─ Return token
 ```
 
-Brief double-fetch on concurrent expiry is acceptable. `CachedTokenSource` also implements `InvalidatingTokenSource` for retry-on-401 logic.
+Brief double-fetch on concurrent expiry is acceptable. Implements `InvalidatingTokenSource` for retry-on-401 logic.
 
 ### AWS Bedrock Auth
 
@@ -295,8 +296,8 @@ All errors flow through typed error types:
 HTTP error response
   │
   ├─ goai.ParseHTTPErrorWithHeaders(providerID, status, body, headers)
-  │   ├─ extractErrorMessage() — tries {error.message}, {message}, {error}
-  │   ├─ IsOverflow(message) — matches 14 regex patterns across providers
+  │   ├─ extractErrorMessage() — tries 5+ JSON paths ({error.message}, {message}, {error}, {detail}, etc.)
+  │   ├─ IsOverflow(message) — matches 14 regex patterns across 20+ providers
   │   │   └─ return *ContextOverflowError
   │   └─ return *APIError{StatusCode, IsRetryable, ResponseHeaders}
   │
@@ -345,6 +346,19 @@ When enabled via `WithPromptCaching(true)`, `applyCaching` copies messages (neve
 6. **Interface compliance checks** — every provider has `var _ provider.LanguageModel = (*chatModel)(nil)`
 7. **Shared utilities in `internal/`** — common code lives once, not duplicated per provider
 8. **90% test coverage** — mock HTTP servers, not internals; E2E tests for tier-1 providers
+
+## Implementation Highlights
+
+Key architectural decisions that shape the SDK:
+
+- **OpenAI dual API routing**: o3/gpt‑5+/codex models always use Responses API. Others use Responses API by default, Chat Completions with `useResponsesAPI: false`. Separate `responses.go` handles different SSE format.
+- **Token caching without blocking**: `CachedTokenSource` releases mutex before network calls, accepting brief double‑fetch to avoid goroutine deadlock.
+- **Cross‑provider error pattern matching**: 14 regex patterns detect "context overflow" across 20+ providers' inconsistent error messages, enabling uniform `ContextOverflowError`.
+- **Bedrock AWS independence**: Manual SigV4 signing and EventStream binary protocol parsing avoid AWS SDK dependency.
+- **Provider‑defined tools scale**: 20+ tools across 5 providers, each with options structs, version handling, and provider‑specific serialization (~2000 LOC).
+- **Structured output multi‑strategy**: Anthropic uses native `output_format` (claude‑3.5+), tool trick (older), or system prompt fallback, adapting to varying provider capabilities.
+
+These decisions maintain a single API surface while supporting diverse provider implementations.
 
 ## Directory Structure
 
