@@ -35,6 +35,9 @@ jobs:
         run: |
           TAG=${GITHUB_REF#refs/tags/}
           DATE=$(date -u +%Y-%m-%d)
+          if [ ! -f docs/public/versions.json ]; then
+            echo '{"latest":"","versions":[]}' > docs/public/versions.json
+          fi
           cat docs/public/versions.json | \
             python3 -c "
           import json, sys
