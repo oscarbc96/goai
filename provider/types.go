@@ -406,4 +406,7 @@ type EmbedResult struct {
 
 	// Usage tracks token consumption.
 	Usage Usage
+
+	// ProviderMetadata contains provider-specific response data.
+	ProviderMetadata map[string]map[string]any
 }

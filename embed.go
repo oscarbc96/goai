@@ -17,6 +17,9 @@ type EmbedResult struct {
 
 	// Usage tracks token consumption.
 	Usage provider.Usage
+
+	// ProviderMetadata contains provider-specific response data.
+	ProviderMetadata map[string]map[string]any
 }
 
 // EmbedManyResult is the result of multiple embedding generations.
@@ -26,6 +29,9 @@ type EmbedManyResult struct {
 
 	// Usage is the aggregated token consumption.
 	Usage provider.Usage
+
+	// ProviderMetadata contains provider-specific response data.
+	ProviderMetadata map[string]map[string]any
 }
 
 // Embed generates an embedding vector for a single value.
@@ -58,8 +64,9 @@ func Embed(ctx context.Context, model provider.EmbeddingModel, value string, opt
 	}
 
 	return &EmbedResult{
-		Embedding: result.Embeddings[0],
-		Usage:     result.Usage,
+		Embedding:        result.Embeddings[0],
+		Usage:            result.Usage,
+		ProviderMetadata: result.ProviderMetadata,
 	}, nil
 }
 
@@ -97,8 +104,9 @@ func EmbedMany(ctx context.Context, model provider.EmbeddingModel, values []stri
 			return nil, fmt.Errorf("goai: embedding count mismatch: got %d, expected %d", len(result.Embeddings), len(values))
 		}
 		return &EmbedManyResult{
-			Embeddings: result.Embeddings,
-			Usage:      result.Usage,
+			Embeddings:       result.Embeddings,
+			Usage:            result.Usage,
+			ProviderMetadata: result.ProviderMetadata,
 		}, nil
 	}
 
@@ -124,7 +132,9 @@ func EmbedMany(ctx context.Context, model provider.EmbeddingModel, values []stri
 	var wg sync.WaitGroup
 
 	for i, chunk := range chunks {
-		wg.Go(func() {
+		wg.Add(1)
+		go func(i int, chunk []string) {
+			defer wg.Done()
 			// Use select to avoid blocking forever if ctx is cancelled
 			// while waiting for the semaphore.
 			select {
@@ -139,7 +149,7 @@ func EmbedMany(ctx context.Context, model provider.EmbeddingModel, values []stri
 				return model.DoEmbed(ctx, chunk, embedParams)
 			})
 			results[i] = chunkResult{result: r, err: err}
-		})
+		}(i, chunk)
 	}
 	wg.Wait()
 
@@ -159,7 +169,8 @@ func EmbedMany(ctx context.Context, model provider.EmbeddingModel, values []stri
 	}
 
 	return &EmbedManyResult{
-		Embeddings: allEmbeddings,
-		Usage:      totalUsage,
+		Embeddings:       allEmbeddings,
+		Usage:            totalUsage,
+		ProviderMetadata: results[0].result.ProviderMetadata, // Take from first chunk
 	}, nil
 }

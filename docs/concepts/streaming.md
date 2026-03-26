@@ -31,13 +31,15 @@ fmt.Println()
 
 ### Stream() - full stream chunks
 
-Returns a `<-chan provider.StreamChunk` with all chunk types: text, tool calls, finish events, usage data.
+Returns a `<-chan provider.StreamChunk` with all chunk types: text, reasoning, tool calls, finish events, usage data.
 
 ```go
 for chunk := range stream.Stream() {
     switch chunk.Type {
     case provider.ChunkText:
         fmt.Print(chunk.Text)
+    case provider.ChunkReasoning:
+        fmt.Print(chunk.Text) // Extended thinking
     case provider.ChunkToolCall:
         fmt.Printf("Tool call: %s(%s)\n", chunk.ToolName, chunk.ToolInput)
     case provider.ChunkFinish:
@@ -111,12 +113,13 @@ fmt.Println(result.Text)
 
 Both `StreamText` (via `Result()`) and `GenerateText` return a `*TextResult`:
 
-| Field          | Type                       | Description                                  |
-|----------------|---------------------------|-----------------------------------------------|
-| `Text`         | `string`                   | Accumulated generated text                    |
-| `ToolCalls`    | `[]provider.ToolCall`      | Tool calls from the final step                |
-| `Steps`        | `[]StepResult`             | Per-step results (for multi-step tool loops)  |
-| `TotalUsage`   | `provider.Usage`           | Aggregated token usage across all steps       |
-| `FinishReason` | `provider.FinishReason`    | Why generation stopped                        |
-| `Response`     | `provider.ResponseMetadata`| Provider metadata (response ID, actual model) |
-| `Sources`      | `[]provider.Source`        | Citations/references from the response        |
+| Field              | Type                        | Description                                   |
+| ------------------ | --------------------------- | --------------------------------------------- |
+| `Text`             | `string`                    | Accumulated generated text                    |
+| `ToolCalls`        | `[]provider.ToolCall`       | Tool calls from the final step                |
+| `Steps`            | `[]goai.StepResult`         | Per-step results (for multi-step tool loops)  |
+| `TotalUsage`       | `provider.Usage`            | Aggregated token usage across all steps       |
+| `FinishReason`     | `provider.FinishReason`     | Why generation stopped                        |
+| `Response`         | `provider.ResponseMetadata` | Provider metadata (response ID, actual model) |
+| `ProviderMetadata` | `map[string]map[string]any` | Provider-specific response data               |
+| `Sources`          | `[]provider.Source`         | Citations/references from the response        |

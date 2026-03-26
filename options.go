@@ -212,11 +212,6 @@ func WithToolChoice(tc string) Option {
 	return func(o *options) { o.ToolChoice = tc }
 }
 
-// WithOnStepFinish sets a callback invoked after each generation step completes.
-func WithOnStepFinish(fn func(StepResult)) Option {
-	return func(o *options) { o.OnStepFinish = fn }
-}
-
 // WithExplicitSchema overrides auto-generated JSON Schema for GenerateObject/StreamObject.
 func WithExplicitSchema(schema json.RawMessage) Option {
 	return func(o *options) { o.ExplicitSchema = schema }

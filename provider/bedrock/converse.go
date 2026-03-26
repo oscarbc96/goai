@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/zendev-sh/goai/internal/httpc"
 	"github.com/zendev-sh/goai/provider"
 )
 
@@ -279,26 +280,22 @@ func convertParts(parts []provider.Part, docNames map[string]int) []map[string]a
 				}
 			}
 		case provider.PartImage:
+			mediaType, data, ok := httpc.ParseDataURL(p.URL)
 			format := "png"
-			data := p.URL
 			if p.MediaType != "" {
-				// Extract format from media type (e.g., "image/jpeg" → "jpeg").
 				if idx := strings.Index(p.MediaType, "/"); idx >= 0 {
 					format = p.MediaType[idx+1:]
 				}
-			}
-			// Strip data URL prefix if present (e.g., "data:image/png;base64,<data>" → "<data>").
-			// Bedrock Converse API expects raw base64 bytes, not data URLs.
-			if idx := strings.Index(data, ";base64,"); idx >= 0 {
-				// Also extract format from data URL if MediaType wasn't set.
-				if p.MediaType == "" {
-					prefix := data[:idx] // "data:image/png"
-					if slashIdx := strings.Index(prefix, "/"); slashIdx >= 0 {
-						format = prefix[slashIdx+1:]
-					}
+			} else if ok {
+				if idx := strings.Index(mediaType, "/"); idx >= 0 {
+					format = mediaType[idx+1:]
 				}
-				data = data[idx+8:] // skip ";base64,"
 			}
+
+			if !ok {
+				data = p.URL
+			}
+
 			block := map[string]any{
 				"image": map[string]any{
 					"format": format,
@@ -340,9 +337,9 @@ func convertParts(parts []provider.Part, docNames map[string]int) []map[string]a
 			}
 			// p.URL may be a data URL ("data:mime;base64,...") or raw base64.
 			// Bedrock Converse API expects raw base64 in source.bytes.
-			data := p.URL
-			if idx := strings.Index(data, ";base64,"); idx >= 0 && strings.HasPrefix(data, "data:") {
-				data = data[idx+8:]
+			_, data, _ := httpc.ParseDataURL(p.URL)
+			if data == "" {
+				data = p.URL
 			}
 			blocks = append(blocks, map[string]any{
 				"document": map[string]any{
@@ -373,14 +370,14 @@ func parseConverseResponse(body []byte) (*provider.GenerateResult, error) {
 				Content []json.RawMessage `json:"content"`
 			} `json:"message"`
 		} `json:"output"`
-		StopReason                       string `json:"stopReason"`
-		AdditionalModelResponseFields    json.RawMessage `json:"additionalModelResponseFields,omitempty"`
-		Trace                            json.RawMessage `json:"trace,omitempty"`
-		Usage struct {
-			InputTokens          int `json:"inputTokens"`
-			OutputTokens         int `json:"outputTokens"`
-			TotalTokens          int `json:"totalTokens"`
-			CacheReadInputTokens int `json:"cacheReadInputTokens"`
+		StopReason                    string          `json:"stopReason"`
+		AdditionalModelResponseFields json.RawMessage `json:"additionalModelResponseFields,omitempty"`
+		Trace                         json.RawMessage `json:"trace,omitempty"`
+		Usage                         struct {
+			InputTokens           int `json:"inputTokens"`
+			OutputTokens          int `json:"outputTokens"`
+			TotalTokens           int `json:"totalTokens"`
+			CacheReadInputTokens  int `json:"cacheReadInputTokens"`
 			CacheWriteInputTokens int `json:"cacheWriteInputTokens"`
 		} `json:"usage"`
 	}
@@ -491,10 +488,10 @@ func parseEventStream(ctx context.Context, body io.ReadCloser, out chan<- provid
 	// For tool blocks, accumulate input deltas so the final ChunkToolCall
 	// includes the full tool input (matches openaicompat accumulation pattern).
 	type blockInfo struct {
-		isToolUse  bool
-		toolUseID  string
-		toolName   string
-		inputBuf   strings.Builder // accumulated tool input JSON fragments
+		isToolUse bool
+		toolUseID string
+		toolName  string
+		inputBuf  strings.Builder // accumulated tool input JSON fragments
 	}
 	blocks := make(map[int]*blockInfo)
 
@@ -725,4 +722,3 @@ func bedrockDocumentFormat(mimeType string) string {
 		return "txt"
 	}
 }
-

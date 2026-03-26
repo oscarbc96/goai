@@ -512,7 +512,6 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 	return result
 }
 
-
 // --- SSE parsing ---
 
 // groundingChunk represents a single grounding source from Gemini's groundingMetadata.
@@ -547,7 +546,7 @@ type geminiResponse struct {
 				} `json:"functionCall,omitempty"`
 			} `json:"parts"`
 		} `json:"content"`
-		FinishReason     string             `json:"finishReason,omitempty"`
+		FinishReason      string             `json:"finishReason,omitempty"`
 		GroundingMetadata *groundingMetadata `json:"groundingMetadata,omitempty"`
 	} `json:"candidates"`
 	UsageMetadata *struct {

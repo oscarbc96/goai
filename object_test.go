@@ -916,7 +916,7 @@ func strContains(s, substr string) bool {
 
 // --- truncate tests ---
 
-func TestTruncate(t *testing.T) {
+func TestTruncate_StringWithEllipsis(t *testing.T) {
 	if got := truncate("hello", 10); got != "hello" {
 		t.Errorf("truncate short = %q, want %q", got, "hello")
 	}

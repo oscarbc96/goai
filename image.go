@@ -44,13 +44,17 @@ func GenerateImage(ctx context.Context, model provider.ImageModel, opts ...Image
 	}
 
 	return &ImageResult{
-		Images: result.Images,
+		Images:           result.Images,
+		ProviderMetadata: result.ProviderMetadata,
 	}, nil
 }
 
 // ImageResult contains the generated images.
 type ImageResult struct {
 	Images []provider.ImageData
+
+	// ProviderMetadata contains provider-specific response data.
+	ProviderMetadata map[string]map[string]any
 }
 
 // ImageOption configures image generation.

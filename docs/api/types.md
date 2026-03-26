@@ -25,6 +25,7 @@ type TextResult struct {
     TotalUsage   provider.Usage           // Aggregated token usage across all steps.
     FinishReason provider.FinishReason    // Why generation stopped.
     Response     provider.ResponseMetadata // Provider metadata from the last step.
+    ProviderMetadata map[string]map[string]any // Provider-specific response data.
     Sources      []provider.Source        // Citations/references from all steps.
 }
 ```
@@ -41,6 +42,7 @@ type StepResult struct {
     FinishReason provider.FinishReason    // Finish reason for this step.
     Usage        provider.Usage           // Token usage for this step.
     Response     provider.ResponseMetadata // Provider metadata for this step.
+    ProviderMetadata map[string]map[string]any // Provider-specific response data.
     Sources      []provider.Source        // Citations from this step.
 }
 ```
@@ -54,7 +56,7 @@ A streaming text generation response with three consumption modes.
 | `Stream()`     | `<-chan provider.StreamChunk` | Raw stream chunks (all types).                     |
 | `TextStream()` | `<-chan string`               | Text content only.                                 |
 | `Result()`     | `*TextResult`                 | Blocks until complete, returns accumulated result. |
-| `Err()`        | `error`                       | Blocks until the stream is fully consumed, then returns any error encountered during streaming. |
+| `Err()`        | `error`                       | Returns the first stream error encountered.        |
 
 `Stream()` and `TextStream()` are mutually exclusive. `Result()` can be called after either.
 
@@ -64,10 +66,11 @@ The final result of a structured output generation.
 
 ```go
 type ObjectResult[T any] struct {
-    Object       T                        // The parsed structured output.
-    Usage        provider.Usage           // Token consumption.
-    FinishReason provider.FinishReason    // Why generation stopped.
-    Response     provider.ResponseMetadata // Provider metadata.
+    Object           T                        // The parsed structured output.
+    Usage            provider.Usage           // Token consumption.
+    FinishReason     provider.FinishReason    // Why generation stopped.
+    Response         provider.ResponseMetadata // Provider metadata.
+    ProviderMetadata map[string]map[string]any // Provider-specific response data.
 }
 ```
 
@@ -79,7 +82,7 @@ A streaming structured output response.
 | ----------------------- | --------------------------- | ------------------------------------------------------ |
 | `PartialObjectStream()` | `<-chan *T`                 | Emits progressively populated partial objects.         |
 | `Result()`              | `(*ObjectResult[T], error)` | Blocks until complete, returns final validated object. |
-| `Err()`                 | `error`                     | Blocks until the stream is fully consumed, then returns any error encountered during streaming. |
+| `Err()`                 | `error`                     | Returns the first stream error encountered.            |
 
 ### EmbedResult
 
@@ -87,8 +90,9 @@ The result of a single embedding generation.
 
 ```go
 type EmbedResult struct {
-    Embedding []float64     // The generated vector.
-    Usage     provider.Usage // Token consumption.
+    Embedding        []float64                 // The generated vector.
+    Usage            provider.Usage            // Token consumption.
+    ProviderMetadata map[string]map[string]any // Provider-specific response data.
 }
 ```
 
@@ -98,8 +102,9 @@ The result of a batch embedding generation.
 
 ```go
 type EmbedManyResult struct {
-    Embeddings [][]float64   // One vector per input value.
-    Usage      provider.Usage // Aggregated token consumption.
+    Embeddings       [][]float64               // One vector per input value.
+    Usage            provider.Usage            // Aggregated token consumption.
+    ProviderMetadata map[string]map[string]any // Provider-specific response data.
 }
 ```
 
@@ -109,7 +114,8 @@ The result of image generation.
 
 ```go
 type ImageResult struct {
-    Images []provider.ImageData // Generated images.
+    Images           []provider.ImageData      // Generated images.
+    ProviderMetadata map[string]map[string]any // Provider-specific response data.
 }
 ```
 

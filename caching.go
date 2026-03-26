@@ -6,6 +6,8 @@ import (
 	"github.com/zendev-sh/goai/provider"
 )
 
+const cacheControlEphemeral = "ephemeral"
+
 // applyCaching applies cache control markers to system messages only.
 // Per arxiv 2601.06007v2: caching system prompts (not conversation messages or
 // tool results) saves 41-80% cost and 13-31% latency for agentic workloads.
@@ -21,7 +23,7 @@ func applyCaching(msgs []provider.Message) []provider.Message {
 		// Copy content slice to avoid mutating original.
 		content := slices.Clone(result[i].Content)
 		lastIdx := len(content) - 1
-		content[lastIdx].CacheControl = "ephemeral"
+		content[lastIdx].CacheControl = cacheControlEphemeral
 		result[i].Content = content
 	}
 	return result

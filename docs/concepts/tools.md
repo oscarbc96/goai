@@ -108,6 +108,10 @@ result, err := goai.GenerateText(ctx, model,
 `WithOnToolCall` is called after each individual tool execution:
 
 ```go
+import "time"
+
+// ...
+
 goai.WithOnToolCall(func(info goai.ToolCallInfo) {
     fmt.Printf("Tool %s took %v\n", info.ToolName, info.Duration)
     if info.Error != nil {
@@ -116,20 +120,29 @@ goai.WithOnToolCall(func(info goai.ToolCallInfo) {
 })
 ```
 
+### ToolCallInfo Fields
+
+| Field      | Type            | Description                        |
+| ---------- | --------------- | ---------------------------------- |
+| `ToolName` | `string`        | Name of the tool that was executed |
+| `Duration` | `time.Duration` | Time taken to execute the tool     |
+| `Error`    | `error`         | Error returned by the tool, if any |
+
 ## Tools Without Execute
 
 If a tool has no `Execute` function, GoAI sends the tool definition to the model but does not participate in the auto loop. The model can still request the tool call, and it appears in `result.ToolCalls`. This is useful when you manage the tool loop yourself.
 
 ## StepResult
 
-Each step in a multi-step tool loop produces a `StepResult`:
+Each step in a multi-step tool loop produces a `goai.StepResult`:
 
-| Field          | Type                    | Description                          |
-|----------------|------------------------|---------------------------------------|
-| `Number`       | `int`                   | 1-based step index                   |
-| `Text`         | `string`                | Text generated in this step          |
-| `ToolCalls`    | `[]provider.ToolCall`   | Tool calls requested in this step    |
-| `FinishReason` | `provider.FinishReason` | Why this step stopped                |
-| `Usage`        | `provider.Usage`        | Token usage for this step            |
-| `Response`     | `provider.ResponseMetadata` | Provider metadata for this step  |
-| `Sources`      | `[]provider.Source`     | Citations from this step             |
+| Field              | Type                        | Description                          |
+| ------------------ | --------------------------- | ------------------------------------ |
+| `Number`           | `int`                       | 1-based step index                   |
+| `Text`             | `string`                    | Text generated in this step          |
+| `ToolCalls`        | `[]provider.ToolCall`       | Tool calls requested in this step    |
+| `FinishReason`     | `provider.FinishReason`     | Why this step stopped                |
+| `Usage`            | `provider.Usage`            | Token usage for this step            |
+| `Response`         | `provider.ResponseMetadata` | Provider metadata for this step      |
+| `ProviderMetadata` | `map[string]map[string]any` | Provider-specific data for this step |
+| `Sources`          | `[]provider.Source`         | Citations from this step             |

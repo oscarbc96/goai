@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
@@ -290,8 +291,8 @@ func TestStreamText_ErrorFromProvider(t *testing.T) {
 	if !errors.As(err, &apiErr) {
 		t.Fatalf("expected *APIError, got %T", err)
 	}
-	if apiErr.StatusCode != 429 {
-		t.Errorf("status = %d, want 429", apiErr.StatusCode)
+	if apiErr.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want %d", apiErr.StatusCode, http.StatusTooManyRequests)
 	}
 }
 

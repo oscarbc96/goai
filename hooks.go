@@ -54,6 +54,11 @@ type ToolCallInfo struct {
 	Error error
 }
 
+// WithOnStepFinish sets a callback invoked after each generation step completes.
+func WithOnStepFinish(fn func(StepResult)) Option {
+	return func(o *options) { o.OnStepFinish = fn }
+}
+
 // WithOnRequest sets a callback invoked before each model call.
 func WithOnRequest(fn func(RequestInfo)) Option {
 	return func(o *options) { o.OnRequest = fn }

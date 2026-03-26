@@ -35,6 +35,10 @@ type TextResult struct {
 	// Response contains provider metadata from the last step (ID, Model).
 	Response provider.ResponseMetadata
 
+	// ProviderMetadata contains provider-specific response data from the last step
+	// (e.g. logprobs, prediction tokens).
+	ProviderMetadata map[string]map[string]any
+
 	// Sources contains citations/references extracted from the response.
 	Sources []provider.Source
 }
@@ -58,6 +62,9 @@ type StepResult struct {
 
 	// Response contains provider metadata for this step (ID, Model).
 	Response provider.ResponseMetadata
+
+	// ProviderMetadata contains provider-specific response data for this step.
+	ProviderMetadata map[string]map[string]any
 
 	// Sources contains citations/references from this step.
 	Sources []provider.Source
@@ -180,7 +187,7 @@ func (ts *TextStream) consume(rawOut chan<- provider.StreamChunk, textOut chan<-
 
 	for chunk := range ts.source {
 		switch chunk.Type {
-		case provider.ChunkText:
+		case provider.ChunkText, provider.ChunkReasoning:
 			ts.text.WriteString(chunk.Text)
 			// Capture per-annotation sources (e.g. url_citation).
 			if s, ok := chunk.Metadata["source"].(provider.Source); ok {
@@ -192,9 +199,9 @@ func (ts *TextStream) consume(rawOut chan<- provider.StreamChunk, textOut chan<-
 				Name:  chunk.ToolName,
 				Input: json.RawMessage(chunk.ToolInput),
 			})
-		case provider.ChunkFinish:
+		case provider.ChunkFinish, provider.ChunkStepFinish:
 			ts.finishReason = chunk.FinishReason
-			ts.usage = chunk.Usage
+			ts.usage = addUsage(ts.usage, chunk.Usage)
 			ts.response = chunk.Response
 			// Capture top-level citations (xAI, Perplexity).
 			if sources, ok := chunk.Metadata["sources"].([]provider.Source); ok {
@@ -400,13 +407,14 @@ func GenerateText(ctx context.Context, model provider.LanguageModel, opts ...Opt
 		}
 
 		stepResult := StepResult{
-			Number:       step,
-			Text:         result.Text,
-			ToolCalls:    result.ToolCalls,
-			FinishReason: result.FinishReason,
-			Usage:        result.Usage,
-			Response:     result.Response,
-			Sources:      result.Sources,
+			Number:           step,
+			Text:             result.Text,
+			ToolCalls:        result.ToolCalls,
+			FinishReason:     result.FinishReason,
+			Usage:            result.Usage,
+			Response:         result.Response,
+			ProviderMetadata: result.ProviderMetadata,
+			Sources:          result.Sources,
 		}
 		steps = append(steps, stepResult)
 		totalUsage = addUsage(totalUsage, result.Usage)
@@ -516,13 +524,14 @@ func buildTextResult(steps []StepResult, totalUsage provider.Usage) *TextResult 
 	}
 
 	return &TextResult{
-		Text:         allText.String(),
-		ToolCalls:    last.ToolCalls,
-		Steps:        steps,
-		TotalUsage:   totalUsage,
-		FinishReason: last.FinishReason,
-		Response:     last.Response,
-		Sources:      allSources,
+		Text:             allText.String(),
+		ToolCalls:        last.ToolCalls,
+		Steps:            steps,
+		TotalUsage:       totalUsage,
+		FinishReason:     last.FinishReason,
+		Response:         last.Response,
+		ProviderMetadata: last.ProviderMetadata,
+		Sources:          allSources,
 	}
 }
 

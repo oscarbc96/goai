@@ -120,9 +120,11 @@ func (m *chatModel) Capabilities() provider.ModelCapabilities {
 		Temperature: !isReasoningModel(m.id),
 		Reasoning:   isReasoningModel(m.id),
 		ToolCall:    true,
+		Attachment:  true,
 		InputModalities: provider.ModalitySet{
 			Text:  true,
 			Image: true,
+			PDF:   true,
 		},
 		OutputModalities: provider.ModalitySet{Text: true},
 	}

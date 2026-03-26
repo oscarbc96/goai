@@ -312,7 +312,7 @@ Sets the maximum number of concurrent API calls when `EmbedMany` auto-chunks a l
 func WithMaxParallelCalls(n int) Option
 ```
 
-**Default:** `4`.
+**Default:** `0` (applied at runtime in `embed.go:112-115` as `4`).
 
 ### WithEmbeddingProviderOptions
 

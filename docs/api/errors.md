@@ -157,7 +157,7 @@ func ClassifyStreamError(body []byte) error
 
 ## ErrUnknownTool
 
-Sentinel error set on `ToolCallInfo.Error` when a tool call references a tool not in the tool map during auto tool loop execution.
+Sentinel error set on `ToolCallInfo.Error` when a tool call references a tool not in the tool map during auto tool loop execution. Defined in the `goai` package.
 
 ```go
 var ErrUnknownTool = errors.New("goai: unknown tool")

@@ -3,6 +3,7 @@ package goai
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
@@ -17,8 +18,8 @@ func TestRetryable(t *testing.T) {
 	}{
 		{"nil", nil, false},
 		{"non-API", fmt.Errorf("random"), false},
-		{"retryable", &APIError{StatusCode: 429, IsRetryable: true}, true},
-		{"not retryable", &APIError{StatusCode: 400, IsRetryable: false}, false},
+		{"retryable", &APIError{StatusCode: http.StatusTooManyRequests, IsRetryable: true}, true},
+		{"not retryable", &APIError{StatusCode: http.StatusBadRequest, IsRetryable: false}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -66,7 +67,7 @@ func TestWithRetry_RetryThenSuccess(t *testing.T) {
 	result, err := withRetry(t.Context(), 2, func() (string, error) {
 		calls++
 		if calls < 3 {
-			return "", &APIError{StatusCode: 429, IsRetryable: true, Message: "rate limited"}
+			return "", &APIError{StatusCode: http.StatusTooManyRequests, IsRetryable: true, Message: "rate limited"}
 		}
 		return "ok", nil
 	})
@@ -85,7 +86,7 @@ func TestWithRetry_AllFail(t *testing.T) {
 	calls := 0
 	_, err := withRetry(t.Context(), 2, func() (string, error) {
 		calls++
-		return "", &APIError{StatusCode: 503, IsRetryable: true, Message: "unavailable"}
+		return "", &APIError{StatusCode: http.StatusServiceUnavailable, IsRetryable: true, Message: "unavailable"}
 	})
 	if err == nil {
 		t.Fatal("expected error")
@@ -99,7 +100,7 @@ func TestWithRetry_NonRetryable(t *testing.T) {
 	calls := 0
 	_, err := withRetry(t.Context(), 2, func() (string, error) {
 		calls++
-		return "", &APIError{StatusCode: 400, IsRetryable: false, Message: "bad request"}
+		return "", &APIError{StatusCode: http.StatusBadRequest, IsRetryable: false, Message: "bad request"}
 	})
 	if err == nil {
 		t.Fatal("expected error")
@@ -115,7 +116,7 @@ func TestWithRetry_ContextCancelled(t *testing.T) {
 	cancel() // Cancel immediately.
 	_, err := withRetry(ctx, 5, func() (string, error) {
 		calls++
-		return "", &APIError{StatusCode: 429, IsRetryable: true, Message: "rate limited"}
+		return "", &APIError{StatusCode: http.StatusTooManyRequests, IsRetryable: true, Message: "rate limited"}
 	})
 	if err == nil {
 		t.Fatal("expected error")
@@ -164,18 +165,18 @@ func TestRetryAfterDuration(t *testing.T) {
 		},
 		{
 			name: "API error without headers",
-			err:  &APIError{StatusCode: 429, IsRetryable: true},
+			err:  &APIError{StatusCode: http.StatusTooManyRequests, IsRetryable: true},
 			want: 0,
 		},
 		{
 			name: "API error with nil headers map",
-			err:  &APIError{StatusCode: 429, IsRetryable: true, ResponseHeaders: nil},
+			err:  &APIError{StatusCode: http.StatusTooManyRequests, IsRetryable: true, ResponseHeaders: nil},
 			want: 0,
 		},
 		{
 			name: "retry-after-ms valid",
 			err: &APIError{
-				StatusCode:      429,
+				StatusCode:      http.StatusTooManyRequests,
 				IsRetryable:     true,
 				ResponseHeaders: map[string]string{"retry-after-ms": "500"},
 			},
@@ -184,7 +185,7 @@ func TestRetryAfterDuration(t *testing.T) {
 		{
 			name: "retry-after-ms too large (>60s)",
 			err: &APIError{
-				StatusCode:      429,
+				StatusCode:      http.StatusTooManyRequests,
 				IsRetryable:     true,
 				ResponseHeaders: map[string]string{"retry-after-ms": "120000"},
 			},
@@ -193,7 +194,7 @@ func TestRetryAfterDuration(t *testing.T) {
 		{
 			name: "retry-after-ms zero",
 			err: &APIError{
-				StatusCode:      429,
+				StatusCode:      http.StatusTooManyRequests,
 				IsRetryable:     true,
 				ResponseHeaders: map[string]string{"retry-after-ms": "0"},
 			},
@@ -202,7 +203,7 @@ func TestRetryAfterDuration(t *testing.T) {
 		{
 			name: "retry-after-ms negative",
 			err: &APIError{
-				StatusCode:      429,
+				StatusCode:      http.StatusTooManyRequests,
 				IsRetryable:     true,
 				ResponseHeaders: map[string]string{"retry-after-ms": "-100"},
 			},
@@ -211,7 +212,7 @@ func TestRetryAfterDuration(t *testing.T) {
 		{
 			name: "retry-after-ms invalid string",
 			err: &APIError{
-				StatusCode:      429,
+				StatusCode:      http.StatusTooManyRequests,
 				IsRetryable:     true,
 				ResponseHeaders: map[string]string{"retry-after-ms": "not-a-number"},
 			},
@@ -220,7 +221,7 @@ func TestRetryAfterDuration(t *testing.T) {
 		{
 			name: "retry-after seconds valid",
 			err: &APIError{
-				StatusCode:      429,
+				StatusCode:      http.StatusTooManyRequests,
 				IsRetryable:     true,
 				ResponseHeaders: map[string]string{"retry-after": "5"},
 			},
@@ -229,7 +230,7 @@ func TestRetryAfterDuration(t *testing.T) {
 		{
 			name: "retry-after seconds too large (>60)",
 			err: &APIError{
-				StatusCode:      429,
+				StatusCode:      http.StatusTooManyRequests,
 				IsRetryable:     true,
 				ResponseHeaders: map[string]string{"retry-after": "120"},
 			},
@@ -238,7 +239,7 @@ func TestRetryAfterDuration(t *testing.T) {
 		{
 			name: "retry-after seconds zero",
 			err: &APIError{
-				StatusCode:      429,
+				StatusCode:      http.StatusTooManyRequests,
 				IsRetryable:     true,
 				ResponseHeaders: map[string]string{"retry-after": "0"},
 			},
@@ -247,7 +248,7 @@ func TestRetryAfterDuration(t *testing.T) {
 		{
 			name: "retry-after seconds invalid",
 			err: &APIError{
-				StatusCode:      429,
+				StatusCode:      http.StatusTooManyRequests,
 				IsRetryable:     true,
 				ResponseHeaders: map[string]string{"retry-after": "abc"},
 			},
@@ -256,7 +257,7 @@ func TestRetryAfterDuration(t *testing.T) {
 		{
 			name: "retry-after-ms takes priority over retry-after",
 			err: &APIError{
-				StatusCode:      429,
+				StatusCode:      http.StatusTooManyRequests,
 				IsRetryable:     true,
 				ResponseHeaders: map[string]string{"retry-after-ms": "200", "retry-after": "10"},
 			},
@@ -265,7 +266,7 @@ func TestRetryAfterDuration(t *testing.T) {
 		{
 			name: "fallback to retry-after when retry-after-ms is invalid",
 			err: &APIError{
-				StatusCode:      429,
+				StatusCode:      http.StatusTooManyRequests,
 				IsRetryable:     true,
 				ResponseHeaders: map[string]string{"retry-after-ms": "bad", "retry-after": "3"},
 			},
@@ -289,7 +290,7 @@ func TestGenerateText_WithRetry(t *testing.T) {
 		generateFn: func(_ context.Context, _ provider.GenerateParams) (*provider.GenerateResult, error) {
 			calls++
 			if calls == 1 {
-				return nil, &APIError{StatusCode: 429, IsRetryable: true, Message: "rate limited"}
+				return nil, &APIError{StatusCode: http.StatusTooManyRequests, IsRetryable: true, Message: "rate limited"}
 			}
 			return &provider.GenerateResult{Text: "ok", FinishReason: provider.FinishStop}, nil
 		},
@@ -314,7 +315,7 @@ func TestStreamText_WithRetry(t *testing.T) {
 		streamFn: func(_ context.Context, _ provider.GenerateParams) (*provider.StreamResult, error) {
 			calls++
 			if calls == 1 {
-				return nil, &APIError{StatusCode: 503, IsRetryable: true, Message: "unavailable"}
+				return nil, &APIError{StatusCode: http.StatusServiceUnavailable, IsRetryable: true, Message: "unavailable"}
 			}
 			return streamFromChunks(
 				provider.StreamChunk{Type: provider.ChunkText, Text: "ok"},
@@ -388,7 +389,7 @@ func TestWithRetry_ZeroRetries(t *testing.T) {
 	calls := 0
 	_, err := withRetry(t.Context(), 0, func() (string, error) {
 		calls++
-		return "", &APIError{StatusCode: 429, IsRetryable: true, Message: "rate limited"}
+		return "", &APIError{StatusCode: http.StatusTooManyRequests, IsRetryable: true, Message: "rate limited"}
 	})
 	if err == nil {
 		t.Fatal("expected error")

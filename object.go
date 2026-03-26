@@ -26,6 +26,9 @@ type ObjectResult[T any] struct {
 
 	// Response contains provider metadata (ID, Model).
 	Response provider.ResponseMetadata
+
+	// ProviderMetadata contains provider-specific response data.
+	ProviderMetadata map[string]map[string]any
 }
 
 // ObjectStream is a streaming structured output response.
@@ -254,10 +257,11 @@ func GenerateObject[T any](ctx context.Context, model provider.LanguageModel, op
 	}
 
 	return &ObjectResult[T]{
-		Object:       obj,
-		Usage:        result.Usage,
-		FinishReason: result.FinishReason,
-		Response:     result.Response,
+		Object:           obj,
+		Usage:            result.Usage,
+		FinishReason:     result.FinishReason,
+		Response:         result.Response,
+		ProviderMetadata: result.ProviderMetadata,
 	}, nil
 }
 
