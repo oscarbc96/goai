@@ -16,6 +16,7 @@ const providers = [
   { name: 'Groq', icon: '/providers/groq.svg', link: '/providers/groq' },
   { name: 'Cohere', icon: '/providers/cohere.svg', link: '/providers/cohere' },
   { name: 'DeepSeek', icon: '/providers/deepseek.svg', link: '/providers/deepseek' },
+  { name: 'MiniMax', icon: '/providers/minimax.svg', link: '/providers/minimax' },
   { name: 'Ollama', icon: '/providers/ollama.svg', link: '/providers/ollama' },
   { name: 'Fireworks', icon: '/providers/fireworks.svg', link: '/providers/fireworks' },
   { name: 'Together', icon: '/providers/together.svg', link: '/providers/together' },
@@ -52,7 +53,7 @@ onMounted(() => {
           <h1 class="rh-title anim a2">GoAI</h1>
           <p class="rh-slogan anim a3">AI SDK, the Go way.</p>
           <p class="rh-tagline anim a4">
-            One unified API across 20+ providers. Streaming, structured output,
+            One unified API across 21+ providers. Streaming, structured output,
             MCP support, stdlib only.
           </p>
 
@@ -116,6 +117,10 @@ onMounted(() => {
       <div class="rh-whatsnew-inner">
         <p class="rh-section-label">What's new</p>
         <div class="rh-release-list">
+          <a href="/providers/minimax" class="rh-release">
+            <span class="rh-release-tag">v0.5.1</span>
+            <span class="rh-release-text"><strong>MiniMax provider</strong> — M2.7, M2.5, M2.1, M2 via Anthropic-compatible API. Thinking/reasoning, tool calling, streaming.</span>
+          </a>
           <a href="/concepts/mcp" class="rh-release">
             <span class="rh-release-tag">v0.5.0</span>
             <span class="rh-release-text"><strong>MCP Client</strong> — Connect to any MCP server (stdio, HTTP, SSE). Auto-convert tools for GenerateText.</span>
@@ -235,7 +240,7 @@ openai.<span class="fn">Chat</span>(<span class="st">"gpt-4o"</span>,
     <!-- ▸ NUMBERS -->
     <section class="rh-numbers anim a10">
       <div class="rh-numbers-inner">
-        <div class="rh-num"><em>20</em><span>providers</span></div>
+        <div class="rh-num"><em>21</em><span>providers</span></div>
         <div class="rh-num"><em>100+</em><span>models tested</span></div>
         <div class="rh-num"><em>24x</em><span>faster cold start</span></div>
         <div class="rh-num"><em>0</em><span>third-party deps</span></div>
