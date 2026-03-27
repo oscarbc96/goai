@@ -22,6 +22,12 @@ hero:
 
 <div class="vp-doc" style="max-width: 688px; margin: 0 auto; padding: 2rem 1.5rem;">
 
+## What's New
+
+> **v0.5.1** — MiniMax provider: M2.7, M2.5, M2.1, M2 via Anthropic-compatible API. Thinking/reasoning, tool calling, streaming. [Docs →](/providers/minimax)
+>
+> **v0.5.0** — MCP (Model Context Protocol) client. Connect to any MCP server with 3 transports (stdio, HTTP, SSE). Auto-convert MCP tools for use with `GenerateText`. [Docs →](/concepts/mcp)
+
 ## What is GoAI SDK?
 
 GoAI SDK is an open-source Go library for building AI applications. It provides one unified API across 21+ LLM providers — OpenAI, Anthropic, Google Gemini, AWS Bedrock, Azure OpenAI, Groq, Mistral, Cohere, DeepSeek, Ollama, vLLM, and more.
