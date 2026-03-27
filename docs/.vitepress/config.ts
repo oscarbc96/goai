@@ -147,6 +147,7 @@ export default defineConfig({
                 { text: 'xAI (Grok)', link: '/providers/xai' },
                 { text: 'Groq', link: '/providers/groq' },
                 { text: 'DeepSeek', link: '/providers/deepseek' },
+                { text: 'MiniMax', link: '/providers/minimax' },
               ],
             },
             {
