@@ -99,6 +99,10 @@ func FlushTimeout(d time.Duration) TracingOption { return func(c *Config) { c.Fl
 // does not have (NEU-1416).
 const DefaultFlushTimeout = 10 * time.Second
 
+// maxUnparsedOutput caps the raw text recorded for a final step whose output
+// is not valid JSON (a cut-off at the token ceiling).
+const maxUnparsedOutput = 64 << 10
+
 // PublicKey overrides the LANGFUSE_PUBLIC_KEY env var.
 func PublicKey(key string) TracingOption { return func(c *Config) { c.PublicKey = key } }
 
@@ -499,7 +503,21 @@ func (h *Hooks) Run() []goai.Option {
 			}
 			var output any
 			if step.Text != "" {
-				_ = json.Unmarshal([]byte(step.Text), &output)
+				if json.Unmarshal([]byte(step.Text), &output) != nil {
+					// A step cut off at the output ceiling is not valid JSON;
+					// dropping it left NEU-1534's truncated generations with a
+					// null output. Keep the text, minus trailing whitespace (a
+					// runaway can be 800 KB of it), capped.
+					raw := strings.TrimRight(step.Text, " \t\r\n")
+					if len(raw) > maxUnparsedOutput {
+						raw = raw[:maxUnparsedOutput]
+					}
+					output = map[string]any{
+						"unparsed_text":       raw,
+						"text_chars":          len(step.Text),
+						"trailing_whitespace": len(step.Text) - len(strings.TrimRight(step.Text, " \t\r\n")),
+					}
+				}
 			}
 			end(output)
 		}),
