@@ -306,7 +306,13 @@ func (h *Hooks) Run() []goai.Option {
 	// Called lazily on the first OnRequest so runs with no LLM calls don't pay
 	// for a ticker.
 	startFlusher := func() {
-		flushStop = make(chan struct{})
+		// The goroutine selects on its own copy of the channel. end() sets
+		// flushStop to nil right after closing it; re-reading the shared
+		// variable after a flush that was in flight at that moment yields a
+		// nil channel that never becomes ready, so the goroutine never exits
+		// and end()'s flushWG.Wait() blocks forever (NEU-1533).
+		stop := make(chan struct{})
+		flushStop = stop
 		flushWG.Add(1)
 		go func() {
 			defer flushWG.Done()
@@ -316,7 +322,7 @@ func (h *Hooks) Run() []goai.Option {
 				select {
 				case <-ticker.C:
 					flushBounded(context.Background(), cfg, lc)
-				case <-flushStop:
+				case <-stop:
 					return
 				}
 			}
