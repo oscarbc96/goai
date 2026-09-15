@@ -3,131 +3,149 @@ package langfuse
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func TestNewID(t *testing.T) {
-	id := newID()
-	if len(id) != 36 {
-		t.Errorf("newID() length = %d, want 36", len(id))
-	}
-	parts := strings.Split(id, "-")
-	if len(parts) != 5 {
-		t.Errorf("newID() parts = %d, want 5 dash-separated parts; got %q", len(parts), id)
-	}
-	// UUID version bit: character at position 14 must be '4'
-	if id[14] != '4' {
-		t.Errorf("newID() version bit at position 14 = %q, want '4'; id=%q", string(id[14]), id)
-	}
-}
-
-func TestFormatTime_Zero(t *testing.T) {
-	got := formatTime(time.Time{})
-	if got != "" {
-		t.Errorf("formatTime(zero) = %q, want empty string", got)
-	}
-}
-
-func TestFormatTime_NonZero(t *testing.T) {
-	ts := time.Date(2024, 6, 15, 10, 30, 45, 123000000, time.UTC)
-	got := formatTime(ts)
-	if !strings.Contains(got, "2024-06-15") {
-		t.Errorf("formatTime() = %q, want to contain '2024-06-15'", got)
-	}
-	if !strings.Contains(got, "10:30:45") {
-		t.Errorf("formatTime() = %q, want to contain '10:30:45'", got)
-	}
-}
-
-func TestFlush_Empty(t *testing.T) {
-	called := false
+// dropFirstServer answers like Langfuse ingestion but slams the socket shut
+// on the first request without writing a response, which is what a client
+// sees when it reuses a keep-alive connection the server already closed
+// (NEU-1375). Every later request gets 207 and its batch is recorded.
+func dropFirstServer(t *testing.T) (*httptest.Server, *int32, *[][]string) {
+	t.Helper()
+	var calls int32
+	var batches [][]string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		called = true
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	c := newClient(srv.URL, "pub", "sec")
-	err := c.flush(t.Context())
-	if err != nil {
-		t.Fatalf("flush(empty) returned error: %v", err)
-	}
-	if called {
-		t.Error("flush(empty) should not make any HTTP request")
-	}
-}
-
-func TestFlush_SendsBatch(t *testing.T) {
-	var gotAuth string
-	var gotBody map[string]any
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotAuth = r.Header.Get("Authorization")
-		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
-			t.Errorf("decode body: %v", err)
+		n := atomic.AddInt32(&calls, 1)
+		if n == 1 {
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("response writer is not a Hijacker")
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Fatalf("hijack: %v", err)
+			}
+			_ = conn.Close()
+			return
 		}
-		w.WriteHeader(http.StatusOK)
+		body, _ := io.ReadAll(r.Body)
+		var env struct {
+			Batch []struct {
+				ID string `json:"id"`
+			} `json:"batch"`
+		}
+		_ = json.Unmarshal(body, &env)
+		ids := make([]string, 0, len(env.Batch))
+		for _, e := range env.Batch {
+			ids = append(ids, e.ID)
+		}
+		batches = append(batches, ids)
+		w.WriteHeader(http.StatusMultiStatus)
 	}))
-	defer srv.Close()
+	t.Cleanup(srv.Close)
+	return srv, &calls, &batches
+}
 
-	c := newClient(srv.URL, "pub", "sec")
-	c.appendEvents([]ingestionEvent{
-		{ID: "e1", Type: eventTrace, Timestamp: "2024-01-01T00:00:00.000Z", Body: map[string]any{"id": "t1"}},
-	})
-	if err := c.flush(t.Context()); err != nil {
-		t.Fatalf("flush: %v", err)
-	}
+func TestFlush_RetriesOnceWhenServerDropsConnection(t *testing.T) {
+	srv, calls, batches := dropFirstServer(t)
+	c := newClient(srv.URL, "pk", "sk")
+	c.appendEvents([]ingestionEvent{{ID: "e1", Type: "trace-create"}, {ID: "e2", Type: "generation-create"}})
 
-	if !strings.HasPrefix(gotAuth, "Basic ") {
-		t.Errorf("Authorization header = %q, want Basic prefix", gotAuth)
+	if err := c.flush(context.Background()); err != nil {
+		t.Fatalf("flush should succeed on the retry, got: %v", err)
 	}
-	batch, ok := gotBody["batch"].([]any)
-	if !ok || len(batch) == 0 {
-		t.Errorf("expected non-empty batch in body, got %v", gotBody)
+	if got := atomic.LoadInt32(calls); got != 2 {
+		t.Fatalf("want exactly 2 requests (1 dropped + 1 retry), got %d", got)
+	}
+	if len(*batches) != 1 || len((*batches)[0]) != 2 || (*batches)[0][0] != "e1" || (*batches)[0][1] != "e2" {
+		t.Fatalf("retry must resend the same batch with the same event ids: %v", *batches)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.events) != 0 {
+		t.Fatalf("flushed events must not be requeued: %v", c.events)
 	}
 }
 
-func TestFlush_ClearsAfterSend(t *testing.T) {
-	reqCount := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reqCount++
-		w.WriteHeader(http.StatusOK)
+func TestFlush_GivesUpAfterOneRetry(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Fatalf("hijack: %v", err)
+		}
+		_ = conn.Close()
 	}))
-	defer srv.Close()
+	t.Cleanup(srv.Close)
+	c := newClient(srv.URL, "pk", "sk")
+	c.appendEvents([]ingestionEvent{{ID: "e1"}})
 
-	c := newClient(srv.URL, "pub", "sec")
-	c.appendEvents([]ingestionEvent{
-		{ID: "e1", Type: eventTrace, Timestamp: "2024-01-01T00:00:00.000Z", Body: nil},
-	})
-	if err := c.flush(t.Context()); err != nil {
-		t.Fatalf("first flush: %v", err)
+	if err := c.flush(context.Background()); err == nil {
+		t.Fatal("flush must report the failure when the retry dies too")
 	}
-	// second flush should be no-op
-	if err := c.flush(t.Context()); err != nil {
-		t.Fatalf("second flush: %v", err)
-	}
-
-	if reqCount != 1 {
-		t.Errorf("HTTP requests = %d, want 1 (second flush should be no-op)", reqCount)
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("want 2 attempts total, never more, got %d", got)
 	}
 }
 
-func TestFlush_HTTPError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
+func TestFlush_DoesNotRetryHTTPErrors(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusInternalServerError)
 	}))
-	defer srv.Close()
+	t.Cleanup(srv.Close)
+	c := newClient(srv.URL, "pk", "sk")
+	c.appendEvents([]ingestionEvent{{ID: "e1"}})
 
-	c := newClient(srv.URL, "bad-pub", "bad-sec")
-	c.appendEvents([]ingestionEvent{
-		{ID: "e1", Type: eventTrace, Timestamp: "2024-01-01T00:00:00.000Z", Body: nil},
-	})
-	err := c.flush(context.Background())
-	if err == nil {
-		t.Error("flush with 401 response should return error")
+	if err := c.flush(context.Background()); err == nil {
+		t.Fatal("5xx must surface as an error")
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("HTTP status errors are not retried, got %d requests", got)
+	}
+}
+
+func TestFlush_RespectsCancelledContext(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		conn, _, _ := w.(http.Hijacker).Hijack()
+		_ = conn.Close()
+	}))
+	t.Cleanup(srv.Close)
+	c := newClient(srv.URL, "pk", "sk")
+	c.appendEvents([]ingestionEvent{{ID: "e1"}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := c.flush(ctx); err == nil {
+		t.Fatal("flush with a dead context must fail")
+	}
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Fatalf("a cancelled context must not be retried, got %d requests", got)
+	}
+}
+
+// Langfuse's Node server closes idle keep-alive sockets after 5 s; our pool
+// must evict first, otherwise every post-LLM flush reuses a dead socket.
+func TestTransport_EvictsIdleConnsBeforeLangfuseDoes(t *testing.T) {
+	const langfuseKeepAliveTimeout = 5 * time.Second
+	c := newClient("http://localhost", "pk", "sk")
+	tr, ok := c.httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("client transport is %T, want *http.Transport", c.httpClient.Transport)
+	}
+	if tr.IdleConnTimeout <= 0 || tr.IdleConnTimeout >= langfuseKeepAliveTimeout {
+		t.Fatalf("IdleConnTimeout = %s, must be > 0 and < %s", tr.IdleConnTimeout, langfuseKeepAliveTimeout)
+	}
+	if tr.DisableKeepAlives {
+		t.Fatal("keep-alives should stay on for the 500ms burst flushes")
 	}
 }

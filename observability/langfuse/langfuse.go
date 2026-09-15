@@ -24,17 +24,19 @@
 // Observation hierarchy:
 //
 //	Trace
-//	└── Span("agent")            -- wraps the entire run
-//	    ├── Generation("step-1") -- LLM call, child of agent span
-//	    ├── Span("tool-name")    -- tool execution, sibling of generation
-//	    └── Generation("step-2") -- final LLM call
+//	└── Span("agent")            — wraps the entire run
+//	    ├── Generation("step-1") — LLM call, child of agent span
+//	    ├── Span("tool-name")    — tool execution, sibling of generation
+//	    └── Generation("step-2") — final LLM call
 package langfuse
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -78,12 +80,24 @@ func PromptVersion(v int) TracingOption { return func(c *Config) { c.PromptVersi
 // OnFlushError sets a callback for flush errors (default: silently discard).
 func OnFlushError(fn func(error)) TracingOption { return func(c *Config) { c.OnFlushError = fn } }
 
-// EagerToolSpans enables creating tool spans in OnToolCallStart (before execution)
-// with an immediate flush, providing real-time "in-progress" visibility on the
-// Langfuse dashboard. The span is finalized with output/error in OnToolCall.
-// This adds an extra HTTP round-trip per tool call -- only enable for long-running
-// tools where in-progress visibility is valuable.
-func EagerToolSpans(b bool) TracingOption { return func(c *Config) { c.EagerToolSpans = b } }
+// FlushTimeout bounds each HTTP flush to Langfuse (default DefaultFlushTimeout).
+//
+// Flushes run on a detached context — the run's own context is routinely
+// cancelled or expired by the time the final flush happens, and tracing must
+// still be delivered then — so this is the only thing bounding them. A flush
+// that exceeds it fails (reported via OnFlushError) and its events are
+// dropped, which is the documented best-effort contract; what it can no
+// longer do is hold the caller. Agents running under a hard invocation cap
+// (Lambda) size this against the time they hold back for the failure path.
+func FlushTimeout(d time.Duration) TracingOption { return func(c *Config) { c.FlushTimeout = d } }
+
+// DefaultFlushTimeout is the flush bound when FlushTimeout is not set. It is
+// deliberately well under the client's 30s HTTP timeout: the end-of-run flush
+// fires INSIDE goai's GenerateObject (from OnResponse on the error path), so
+// every second it takes is a second the model phase appears to still be
+// running — and on an invocation that has just overrun its budget, seconds it
+// does not have (NEU-1416).
+const DefaultFlushTimeout = 10 * time.Second
 
 // PublicKey overrides the LANGFUSE_PUBLIC_KEY env var.
 func PublicKey(key string) TracingOption { return func(c *Config) { c.PublicKey = key } }
@@ -98,14 +112,9 @@ func Host(host string) TracingOption { return func(c *Config) { c.Host = host } 
 // Credentials are read from env vars unless overridden via PublicKey/SecretKey/Host options.
 // Each invocation creates a fresh trace -- safe for concurrent use.
 //
-// Ordering: WithTracing wraps the singleton hooks (OnBeforeToolExecute, OnAfterToolExecute,
-// OnBeforeStep) to add observability without replacing user hooks. For this to work,
-// WithTracing must be applied AFTER any user-registered singleton hooks. Place it last
-// in the option list, or use WithOptions to group user hooks before WithTracing.
-//
 // Each call allocates a small amount of state for trace isolation. The underlying
-// HTTP connections are pooled by Go's default transport, so creating a new
-// http.Client per call does not waste TCP connections.
+// HTTP connections are pooled by one package-level transport (see client.go),
+// so creating a new http.Client per call does not waste TCP connections.
 //
 // If neither LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY env vars nor PublicKey/SecretKey
 // options are set, WithTracing logs a warning to stderr and returns a no-op option.
@@ -156,9 +165,36 @@ type Config struct {
 	// If nil, flush errors are silently discarded (tracing must not crash the app).
 	OnFlushError func(error)
 
-	// EagerToolSpans creates tool spans in OnToolCallStart with an immediate flush
-	// for real-time in-progress visibility. Adds an extra HTTP round-trip per tool call.
-	EagerToolSpans bool
+	// FlushTimeout bounds each HTTP flush; zero means DefaultFlushTimeout.
+	FlushTimeout time.Duration
+}
+
+// flushBound is the effective per-flush bound.
+func (c Config) flushBound() time.Duration {
+	if c.FlushTimeout > 0 {
+		return c.FlushTimeout
+	}
+	return DefaultFlushTimeout
+}
+
+// flushBounded runs one flush on a detached context bounded by flushBound and
+// reports a failure through OnFlushError, naming the bound when the bound is
+// what failed it.
+func flushBounded(base context.Context, cfg Config, lc *client) {
+	if base == nil {
+		base = context.Background()
+	}
+	bound := cfg.flushBound()
+	ctx, cancel := context.WithTimeout(base, bound)
+	defer cancel()
+	err := lc.flush(ctx)
+	if err == nil || cfg.OnFlushError == nil {
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		err = fmt.Errorf("langfuse: flush exceeded its %s bound, events dropped: %w", bound, err)
+	}
+	cfg.OnFlushError(err)
 }
 
 // Hooks holds the shared HTTP client and config.
@@ -226,7 +262,7 @@ func (h *Hooks) With(opts ...goai.Option) func() []goai.Option {
 }
 
 // Run returns a fresh set of goai options scoped to a single agent run.
-// Safe to call concurrently -- each call gets completely isolated state.
+// Safe to call concurrently — each call gets completely isolated state.
 // OnToolCall may fire from parallel goroutines, so a mutex guards shared state.
 //
 // Deprecated: Use [WithTracing] instead.
@@ -237,59 +273,108 @@ func (h *Hooks) Run() []goai.Option {
 	// Per-run state. Isolated per Run() call. Most hooks are called
 	// sequentially by goai, but OnToolCall may fire from parallel
 	// goroutines when multiple tool calls execute concurrently, so
-	// mu guards writes to obs and lastObsEnd.
+	// mu guards writes to shared state.
 	var (
 		traceID     string
 		agentSpanID string
 		agentStart  time.Time
 		traceInput  any
-		gen         *pendingGen
-		step        int
-		lastObsEnd  time.Time
-		obs         []ingestionEvent
-		mu          sync.Mutex
+		// runCtx is the caller's context for the generation, captured from
+		// the first OnRequest so the final flush in end() honours the
+		// caller's cancellation/deadline instead of running detached.
+		runCtx     context.Context
+		gen        *pendingGen
+		step       int
+		lastObsEnd time.Time
+		mu         sync.Mutex
 
-		// E1: eager tool span IDs (keyed by toolCallID).
-		toolEagerSpanIDs = make(map[string]string) // E1: span ID for reuse in OnToolCall
-
-		// Per-tool state for B1-B3 (keyed by toolCallID).
-		// Written by OnBeforeToolExecute, read by OnToolCall.
-		toolSkipReasons    = make(map[string]string) // B1: skip reason
-		toolInputOverrides = make(map[string]bool)   // B2: input was overridden
-		toolCtxOverrides   = make(map[string]bool)   // B3: context was overridden
-
-		// Per-tool state for C1-C2 (keyed by toolCallID).
-		// Written by OnAfterToolExecute, read by OnToolCall.
-		toolOutputModified = make(map[string]bool) // C1: output was modified
-		toolErrorModified  = make(map[string]string) // C2: "injected" or "replaced"
-
-		// D1-D2: termination tracking.
-		hookStopped       bool   // D1: OnBeforeStep.Stop=true fired
-		hookStoppedAtStep int    // D1: which step was stopped
-		terminationReason string // D2: "natural", "max_steps", or "hook_stopped"
-
-		// D3: injected message count for next generation.
-		pendingInjectedMessages int
-
-		// D4: conversation size from OnBeforeStep for next generation.
-		pendingConversationSize int
-
-		// Final output from the last non-tool-call OnStepFinish, for OnFinish to flush.
-		pendingOutput any
+		flushStop chan struct{}
+		flushWG   sync.WaitGroup
 	)
+
+	// push enqueues an event and triggers an async flush for realtime delivery.
+	// The ticker goroutine also flushes periodically to coalesce bursts.
+	push := func(event ingestionEvent) {
+		lc.appendEvents([]ingestionEvent{event})
+	}
+
+	// startFlusher spins up a background goroutine that flushes every 500ms.
+	// Called lazily on the first OnRequest so runs with no LLM calls don't pay
+	// for a ticker.
+	startFlusher := func() {
+		flushStop = make(chan struct{})
+		flushWG.Add(1)
+		go func() {
+			defer flushWG.Done()
+			ticker := time.NewTicker(500 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					flushBounded(context.Background(), cfg, lc)
+				case <-flushStop:
+					return
+				}
+			}
+		}()
+	}
 
 	// end is declared before opts so WithOnStepFinish can reference it.
 	var end func(result any)
 
+	// OnToolCallStart is intentionally not registered here because
+	// OnToolCall.StartTime already provides accurate timing for tool spans.
 	opts := []goai.Option{
 		goai.WithOnRequest(func(info goai.RequestInfo) {
 			input := messagesToInput(info.Messages)
 
+			if info.Ctx != nil {
+				runCtx = info.Ctx
+			}
 			if traceID == "" {
 				traceID = newID()
 				agentSpanID = newID()
-				agentStart = info.Timestamp // A4: use info.Timestamp instead of time.Now()
+				agentStart = time.Now()
 				traceInput = input
+				startFlusher()
+
+				// Emit the trace and agent span immediately so the run is
+				// visible in Langfuse as soon as it starts. Both will be
+				// re-emitted at end() with final output/endTime; Langfuse
+				// treats repeat events with the same ID as upserts.
+				traceMeta := cfg.Metadata
+				if cfg.Environment != "" {
+					traceMeta = mergeMeta(traceMeta, map[string]any{"environment": cfg.Environment})
+				}
+				push(ingestionEvent{
+					ID:        newID(),
+					Type:      eventTrace,
+					Timestamp: formatTime(agentStart),
+					Body: traceBody{
+						ID:        traceID,
+						Name:      cfg.TraceName,
+						UserID:    cfg.UserID,
+						SessionID: cfg.SessionID,
+						Tags:      cfg.Tags,
+						Metadata:  traceMeta,
+						Release:   cfg.Release,
+						Version:   cfg.Version,
+						Input:     traceInput,
+					},
+				})
+				push(ingestionEvent{
+					ID:        newID(),
+					Type:      eventSpan,
+					Timestamp: formatTime(agentStart),
+					Body: spanBody{
+						ID:        agentSpanID,
+						TraceID:   traceID,
+						Name:      cfg.TraceName,
+						StartTime: formatTime(agentStart),
+						Input:     traceInput,
+						Version:   cfg.Version,
+					},
+				})
 			}
 
 			// Finalise the previous generation with its tool-call output.
@@ -300,7 +385,7 @@ func (h *Hooks) Run() []goai.Option {
 						break
 					}
 				}
-				obs = append(obs, gen.toEvent(traceID, agentSpanID, cfg))
+				push(gen.toEvent(traceID, agentSpanID, cfg))
 				gen = nil
 			}
 
@@ -310,7 +395,7 @@ func (h *Hooks) Run() []goai.Option {
 			// in Langfuse's timeline. Langfuse sorts observations by startTime, so if
 			// a generation starts at the same wall-clock instant as the last tool span
 			// ends (common when tool execution is very fast), they render in wrong order.
-			now := info.Timestamp // A4: use info.Timestamp
+			now := time.Now()
 			if !lastObsEnd.IsZero() {
 				if floor := lastObsEnd.Add(10 * time.Millisecond); !now.After(floor) {
 					now = floor
@@ -320,20 +405,6 @@ func (h *Hooks) Run() []goai.Option {
 			genMeta := map[string]any{}
 			if cfg.Environment != "" {
 				genMeta["environment"] = cfg.Environment
-			}
-			// A3: record message count and tool count.
-			genMeta["message_count"] = info.MessageCount
-			genMeta["tool_count"] = info.ToolCount
-
-			// D3: record injected messages from OnBeforeStep.
-			if pendingInjectedMessages > 0 {
-				genMeta["injected_messages"] = pendingInjectedMessages
-				pendingInjectedMessages = 0
-			}
-			// D4: record conversation size from OnBeforeStep.
-			if pendingConversationSize > 0 {
-				genMeta["conversation_size"] = pendingConversationSize
-				pendingConversationSize = 0
 			}
 
 			gen = &pendingGen{
@@ -351,11 +422,9 @@ func (h *Hooks) Run() []goai.Option {
 				return
 			}
 			gen.latency = info.Latency
-			// A5: record HTTP status code when non-zero (must precede early return on error).
-			if info.StatusCode > 0 {
-				gen.metadata["http_status_code"] = info.StatusCode
-			}
 			if info.Error != nil {
+				// Run failed (e.g. context cancelled, max retries exhausted).
+				// Flush whatever partial trace we have so it's not silently lost.
 				gen.level = levelError
 				gen.statusMsg = info.Error.Error()
 				end(nil)
@@ -384,63 +453,55 @@ func (h *Hooks) Run() []goai.Option {
 			}
 		}),
 
-		goai.WithOnStepFinish(func(sr goai.StepResult) {
-			// A6: record Sources, Response.Model, Response.ID, ProviderMetadata.
-			if gen != nil {
-				if len(sr.Sources) > 0 {
-					gen.metadata["sources"] = sr.Sources
-				}
-				if sr.Response.Model != "" {
-					gen.metadata["response_model"] = sr.Response.Model
-				}
-				if sr.Response.ID != "" {
-					gen.metadata["response_id"] = sr.Response.ID
-				}
-				if len(sr.ProviderMetadata) > 0 {
-					for ns, data := range sr.ProviderMetadata {
-						for k, v := range data {
-							gen.metadata["provider_metadata."+ns+"."+k] = v
-						}
+		goai.WithOnStepFinish(func(step goai.StepResult) {
+			// Emit reasoning summaries as a dedicated sibling span positioned
+			// between the generation and its tool calls. This puts the
+			// chain-of-thought at the top level of the trace view instead of
+			// buried inside the generation's metadata.
+			//
+			// goai's non-streaming Responses path stores reasoning summaries in
+			// step.ProviderMetadata["openai"]["reasoning"] as []{type,text}.
+			if gen != nil && len(step.ProviderMetadata) > 0 {
+				if reasoning := extractReasoning(step.ProviderMetadata); reasoning != "" {
+					// Position the reasoning span at the end of the generation
+					// so it sorts after the generation and before any tool
+					// spans (which start at lastObsEnd + 10ms in OnToolCall).
+					genEnd := gen.startTime.Add(gen.latency)
+					mu.Lock()
+					if genEnd.After(lastObsEnd) {
+						lastObsEnd = genEnd
 					}
+					mu.Unlock()
+					push(ingestionEvent{
+						ID:        newID(),
+						Type:      eventSpan,
+						Timestamp: formatTime(genEnd),
+						Body: spanBody{
+							ID:                  newID(),
+							TraceID:             traceID,
+							ParentObservationID: agentSpanID,
+							Name:                "reasoning",
+							StartTime:           formatTime(genEnd),
+							EndTime:             formatTime(genEnd),
+							Output:              reasoning,
+							Version:             cfg.Version,
+							Metadata: map[string]any{
+								"step":             step.Number,
+								"reasoning_tokens": step.Usage.ReasoningTokens,
+							},
+						},
+					})
 				}
 			}
 
-			// D2: determine termination reason.
-			// "natural" and "hook_stopped" are detected here in OnStepFinish.
-			// "max_steps" is detected in OnFinish via StepsExhausted.
-			if sr.FinishReason == provider.FinishToolCalls {
-				// Capture tool calls on gen so they appear if this is the last step
-				// (max_steps or hook_stopped -- no subsequent OnRequest to finalize gen).
-				if gen != nil && len(sr.ToolCalls) > 0 {
-					var calls []map[string]any
-					for _, tc := range sr.ToolCalls {
-						c := map[string]any{"id": tc.ID, "name": tc.Name}
-						if len(tc.Input) > 0 {
-							var parsed any
-							if json.Unmarshal(tc.Input, &parsed) == nil {
-								c["input"] = parsed
-							}
-						}
-						calls = append(calls, c)
-					}
-					gen.output = calls
-				}
-				return // intermediate step -- more tool calls follow
+			if step.FinishReason == provider.FinishToolCalls {
+				return // intermediate step — more tool calls follow
 			}
-			if !hookStopped {
-				terminationReason = "natural"
+			var output any
+			if step.Text != "" {
+				_ = json.Unmarshal([]byte(step.Text), &output)
 			}
-
-			// Store the final output for OnFinish to flush.
-			// Do NOT call end() here -- OnFinish is the single closer,
-			// ensuring terminationReason is set correctly for all paths
-			// (including max_steps where StepsExhausted overrides).
-			if sr.Text != "" {
-				if err := json.Unmarshal([]byte(sr.Text), &pendingOutput); err != nil {
-					// Plain text (not JSON) -- use the raw string as output.
-					pendingOutput = sr.Text
-				}
-			}
+			end(output)
 		}),
 
 		goai.WithOnToolCall(func(info goai.ToolCallInfo) {
@@ -470,71 +531,20 @@ func (h *Hooks) Run() []goai.Option {
 				statusMsg = info.Error.Error()
 			}
 
-			meta := map[string]any{
-				"tool_call_id": info.ToolCallID,
-				"step":         info.Step,
-			}
-
-			// A1: annotate skipped tools.
-			if info.Skipped {
-				meta["skipped"] = true
-				if level == "" {
-					level = levelWarning
-				}
-			}
-
-			// A2: merge ToolCallInfo.Metadata.
-			for k, v := range info.Metadata {
-				meta[k] = v
-			}
-
-			// B1: skip reason from OnBeforeToolExecute.
-			// Only apply when no error already set -- info.Error is the authoritative
-			// error source; the skip reason is supplementary.
 			mu.Lock()
-			if reason, ok := toolSkipReasons[info.ToolCallID]; ok {
-				if statusMsg == "" {
-					statusMsg = reason
-				}
-				delete(toolSkipReasons, info.ToolCallID)
+			if endTime.After(lastObsEnd) {
+				lastObsEnd = endTime
 			}
-			// B2: input override detection.
-			if toolInputOverrides[info.ToolCallID] {
-				meta["input_overridden"] = true
-				delete(toolInputOverrides, info.ToolCallID)
-			}
-			// B3: context override detection.
-			if toolCtxOverrides[info.ToolCallID] {
-				meta["context_overridden"] = true
-				delete(toolCtxOverrides, info.ToolCallID)
-			}
-			// C1: output modification detection.
-			if toolOutputModified[info.ToolCallID] {
-				meta["output_modified"] = true
-				delete(toolOutputModified, info.ToolCallID)
-			}
-			// C2: error injection/replacement detection.
-			if errMod, ok := toolErrorModified[info.ToolCallID]; ok {
-				meta["error_"+errMod] = true
-				delete(toolErrorModified, info.ToolCallID)
-			}
-
-			// E1: reuse eager span ID if OnToolCallStart already created the span.
-			// Use span-update to update the existing span rather than creating a duplicate.
-			spanID := newID()
-			spanEventType := eventSpan
-			if eagerID, ok := toolEagerSpanIDs[info.ToolCallID]; ok {
-				spanID = eagerID
-				spanEventType = eventSpanUpdate
-				delete(toolEagerSpanIDs, info.ToolCallID)
-			}
-
-			obs = append(obs, ingestionEvent{
+			mu.Unlock()
+			push(ingestionEvent{
+				// ingestionEvent.ID is the deduplication key for the ingestion envelope;
+				// spanBody.ID is the observation ID used for parent-child relationships.
+				// Langfuse requires them to be distinct.
 				ID:        newID(),
-				Type:      spanEventType,
+				Type:      eventSpan,
 				Timestamp: formatTime(start),
 				Body: spanBody{
-					ID:                  spanID,
+					ID:                  newID(),
 					TraceID:             traceID,
 					ParentObservationID: agentSpanID,
 					Name:                info.ToolName,
@@ -543,182 +553,16 @@ func (h *Hooks) Run() []goai.Option {
 					Input:               inputVal,
 					Output:              outputVal,
 					Version:             cfg.Version,
-					Metadata:            meta,
-					Level:               level,
-					StatusMessage:       statusMsg,
-				},
-			})
-			if endTime.After(lastObsEnd) {
-				lastObsEnd = endTime
-			}
-			mu.Unlock()
-		}),
-	}
-
-	// E1: OnToolCallStart for real-time tool visibility (opt-in).
-	if cfg.EagerToolSpans {
-		opts = append(opts, goai.WithOnToolCallStart(func(info goai.ToolCallStartInfo) {
-			if traceID == "" {
-				return
-			}
-
-			var inputVal any = info.Input
-			if len(info.Input) > 0 {
-				var parsed any
-				if json.Unmarshal(info.Input, &parsed) == nil {
-					inputVal = parsed
-				}
-			}
-
-			spanID := newID()
-			now := time.Now()
-
-			mu.Lock()
-			// Store span ID for OnToolCall to reuse.
-			toolEagerSpanIDs[info.ToolCallID] = spanID
-			mu.Unlock()
-
-			// Create partial span and flush immediately for real-time visibility.
-			partial := ingestionEvent{
-				ID:        newID(),
-				Type:      eventSpan,
-				Timestamp: formatTime(now),
-				Body: spanBody{
-					ID:                  spanID,
-					TraceID:             traceID,
-					ParentObservationID: agentSpanID,
-					Name:                info.ToolName,
-					StartTime:           formatTime(now),
-					Input:               inputVal,
-					Version:             cfg.Version,
 					Metadata: map[string]any{
 						"tool_call_id": info.ToolCallID,
 						"step":         info.Step,
-						"status":       "in_progress",
 					},
+					Level:         level,
+					StatusMessage: statusMsg,
 				},
-			}
-
-			lc.appendEvents([]ingestionEvent{partial})
-			if err := lc.flush(context.Background()); err != nil && cfg.OnFlushError != nil {
-				cfg.OnFlushError(err)
-			}
-		}))
+			})
+		}),
 	}
-
-	// OnFinish: fires once after all steps complete. Handles termination reason
-	// detection (including max_steps via StepsExhausted) and ensures end() is called
-	// for all exit paths.
-	opts = append(opts, goai.WithOnFinish(func(info goai.FinishInfo) {
-		if info.StepsExhausted {
-			terminationReason = "max_steps"
-		}
-		// For hook_stopped, terminationReason was already set in OnBeforeStep wrapper.
-		// For natural, it was set in OnStepFinish (which stored output in pendingOutput).
-		// OnFinish is the single success-path closer. end() is also called from
-		// OnResponse on error (line ~361) for partial-trace flushing.
-		end(pendingOutput)
-	}))
-
-	// Section 7.1: Wrapper pattern for singleton hooks (B/C/D categories).
-	// These wrap any existing user hooks, adding observability side-effects
-	// before delegating to the user's original hook.
-
-	// B1-B3: OnBeforeToolExecute wrapper.
-	opts = append(opts, goai.WrapOnBeforeToolExecute(func(userHook func(goai.BeforeToolExecuteInfo) goai.BeforeToolExecuteResult) func(goai.BeforeToolExecuteInfo) goai.BeforeToolExecuteResult {
-		return func(info goai.BeforeToolExecuteInfo) goai.BeforeToolExecuteResult {
-			// Delegate to user hook first (if any).
-			var result goai.BeforeToolExecuteResult
-			if userHook != nil {
-				result = userHook(info)
-			}
-
-			mu.Lock()
-			// B1: capture skip reason for OnToolCall to read.
-			// Note: if the user hook panics, goai forces a skip with a synthetic error
-			// but this wrapper never runs to completion -- the panic-path skip reason
-			// is not captured here. OnToolCall will still see info.Skipped=true and
-			// info.Error with the panic message, so the skip is observable via A1.
-			if result.Skip {
-				reason := "skipped by hook"
-				if result.Error != nil {
-					reason = result.Error.Error()
-				}
-				toolSkipReasons[info.ToolCallID] = reason
-			}
-			// B2: detect input override.
-			if result.Input != nil {
-				toolInputOverrides[info.ToolCallID] = true
-			}
-			// B3: detect context override.
-			if result.Ctx != nil {
-				toolCtxOverrides[info.ToolCallID] = true
-			}
-			mu.Unlock()
-
-			return result
-		}
-	}))
-
-	// C1-C2: OnAfterToolExecute wrapper.
-	opts = append(opts, goai.WrapOnAfterToolExecute(func(userHook func(goai.AfterToolExecuteInfo) goai.AfterToolExecuteResult) func(goai.AfterToolExecuteInfo) goai.AfterToolExecuteResult {
-		return func(info goai.AfterToolExecuteInfo) goai.AfterToolExecuteResult {
-			// Delegate to user hook first (if any).
-			var result goai.AfterToolExecuteResult
-			if userHook != nil {
-				result = userHook(info)
-			}
-
-			mu.Lock()
-			// C1: detect output modification.
-			if result.Output != "" && result.Output != info.Output {
-				toolOutputModified[info.ToolCallID] = true
-			}
-			// C2: detect error injection/replacement.
-			if result.Error != nil {
-				if info.Error == nil {
-					toolErrorModified[info.ToolCallID] = "injected"
-				} else if result.Error.Error() != info.Error.Error() {
-					toolErrorModified[info.ToolCallID] = "replaced"
-				}
-			}
-			mu.Unlock()
-
-			return result
-		}
-	}))
-
-	// D1, D3-D4: OnBeforeStep wrapper.
-	opts = append(opts, goai.WrapOnBeforeStep(func(userHook func(goai.BeforeStepInfo) goai.BeforeStepResult) func(goai.BeforeStepInfo) goai.BeforeStepResult {
-		return func(info goai.BeforeStepInfo) goai.BeforeStepResult {
-			// Delegate to user hook first (if any).
-			var result goai.BeforeStepResult
-			if userHook != nil {
-				result = userHook(info)
-			}
-
-			// D1: detect loop termination signal.
-			if result.Stop {
-				hookStopped = true
-				hookStoppedAtStep = info.Step
-				terminationReason = "hook_stopped"
-				// end() is called by OnFinish (which fires after the loop exits).
-			}
-
-			// D3: track injected messages for next generation.
-			if len(result.ExtraMessages) > 0 {
-				pendingInjectedMessages = len(result.ExtraMessages)
-			}
-
-			// D4: conversation size monitoring -- record len(Messages) per step.
-			// Note: A3 (message_count in OnRequest) covers the same signal at every step
-			// including step 1. D4 adds the pre-step message count from OnBeforeStep.
-			// We store it for the next generation metadata.
-			pendingConversationSize = len(info.Messages)
-
-			return result
-		}
-	}))
 
 	end = func(result any) {
 		if traceID == "" {
@@ -726,13 +570,8 @@ func (h *Hooks) Run() []goai.Option {
 		}
 
 		if gen != nil {
-			// Only overwrite gen.output when result is non-nil. For max_steps and
-			// hook_stopped exits, gen.output was already set to the tool calls by
-			// OnStepFinish (line ~412). Overwriting with nil would lose that data.
-			if result != nil {
-				gen.output = result
-			}
-			obs = append(obs, gen.toEvent(traceID, agentSpanID, cfg))
+			gen.output = result
+			push(gen.toEvent(traceID, agentSpanID, cfg))
 			gen = nil
 		}
 
@@ -743,66 +582,74 @@ func (h *Hooks) Run() []goai.Option {
 			traceMeta = mergeMeta(traceMeta, map[string]any{"environment": cfg.Environment})
 		}
 
-		// D1: annotate trace with hook_stopped if applicable.
-		if hookStopped {
-			traceMeta = mergeMeta(traceMeta, map[string]any{
-				"stopped_by_hook": true,
-				"stopped_at_step": hookStoppedAtStep,
-			})
-		}
-
-		// D2: annotate trace with termination reason.
-		if terminationReason != "" {
-			traceMeta = mergeMeta(traceMeta, map[string]any{
-				"termination_reason": terminationReason,
-			})
-		}
-
-		batch := make([]ingestionEvent, 0, 2+len(obs))
-		batch = append(batch,
-			ingestionEvent{
-				ID:        newID(),
-				Type:      eventTrace,
-				Timestamp: formatTime(agentStart),
-				Body: traceBody{
-					ID:        traceID,
-					Name:      cfg.TraceName,
-					UserID:    cfg.UserID,
-					SessionID: cfg.SessionID,
-					Tags:      cfg.Tags,
-					Metadata:  traceMeta,
-					Release:   cfg.Release,
-					Version:   cfg.Version,
-					Input:     traceInput,
-					Output:    result,
-				},
+		// Re-emit the trace and agent span with final output/endTime.
+		// Langfuse treats repeat events with the same ID as upserts.
+		push(ingestionEvent{
+			ID:        newID(),
+			Type:      eventTrace,
+			Timestamp: formatTime(now),
+			Body: traceBody{
+				ID:        traceID,
+				Name:      cfg.TraceName,
+				UserID:    cfg.UserID,
+				SessionID: cfg.SessionID,
+				Tags:      cfg.Tags,
+				Metadata:  traceMeta,
+				Release:   cfg.Release,
+				Version:   cfg.Version,
+				Input:     traceInput,
+				Output:    result,
 			},
-			ingestionEvent{
-				ID:        newID(),
-				Type:      eventSpan,
-				Timestamp: formatTime(agentStart),
-				Body: spanBody{
-					ID:        agentSpanID,
-					TraceID:   traceID,
-					Name:      cfg.TraceName,
-					StartTime: formatTime(agentStart),
-					EndTime:   formatTime(now),
-					Input:     traceInput,
-					Output:    result,
-					Version:   cfg.Version,
-				},
+		})
+		push(ingestionEvent{
+			ID:        newID(),
+			Type:      eventSpan,
+			Timestamp: formatTime(now),
+			Body: spanBody{
+				ID:        agentSpanID,
+				TraceID:   traceID,
+				Name:      cfg.TraceName,
+				StartTime: formatTime(agentStart),
+				EndTime:   formatTime(now),
+				Input:     traceInput,
+				Output:    result,
+				Version:   cfg.Version,
 			},
-		)
-		batch = append(batch, obs...)
+		})
 
+		// Clear run state — the run is complete.
 		traceID = ""
 		agentSpanID = ""
-		obs = nil
 
-		lc.appendEvents(batch)
-		if err := lc.flush(context.Background()); err != nil && cfg.OnFlushError != nil {
-			cfg.OnFlushError(err)
+		// Stop the background flusher and do a final synchronous flush so
+		// the caller can be confident everything reached Langfuse before
+		// the process exits. Both are bounded by cfg.FlushTimeout: this runs
+		// inside goai's GenerateObject (OnResponse fires it on the error
+		// path), so an unbounded flush against a slow or unreachable Langfuse
+		// held the model phase open for up to the client's 30s timeout — on a
+		// Lambda that had just overrun its budget, that was the difference
+		// between failing loudly and being killed at the cap (NEU-1416).
+		// Worst case here is 2 × FlushTimeout: a ticker flush in flight plus
+		// the final one.
+		if flushStop != nil {
+			close(flushStop)
+			flushStop = nil
+			flushWG.Wait()
 		}
+		// The flush runs under the caller's context while it is alive. Once
+		// the run has been cancelled (the error path above lands here with a
+		// dead ctx) the partial trace is still worth keeping, so fall back to
+		// a detached context that inherits the values but not the
+		// cancellation. Either way flushBounded caps it at cfg.FlushTimeout.
+		base := context.Background()
+		if runCtx != nil {
+			if runCtx.Err() == nil {
+				base = runCtx
+			} else {
+				base = context.WithoutCancel(runCtx)
+			}
+		}
+		flushBounded(base, cfg, lc)
 	}
 
 	return opts
@@ -867,7 +714,6 @@ type usageBody struct {
 const (
 	eventTrace      = "trace-create"
 	eventSpan       = "span-create"
-	eventSpanUpdate = "span-update"
 	eventGeneration = "generation-create"
 	levelWarning    = "WARNING"
 	levelError      = "ERROR"
@@ -948,6 +794,52 @@ func toolCallMap(p provider.Part) map[string]any {
 		}
 	}
 	return tc
+}
+
+// extractReasoning pulls reasoning-summary text out of a provider metadata map
+// and returns it as a single concatenated string. Supported shapes:
+//
+//	providerMetadata["openai"]["reasoning"]  = []{type, text}  (OpenAI Responses)
+//	providerMetadata["google"]["reasoning"]  = "..."           (Gemini thinking)
+//	providerMetadata["anthropic"]["thinking"] = "..."          (Claude thinking)
+//
+// Returns "" when no reasoning is present.
+func extractReasoning(pm map[string]map[string]any) string {
+	var parts []string
+	for _, meta := range pm {
+		for _, key := range []string{"reasoning", "thinking"} {
+			v, ok := meta[key]
+			if !ok {
+				continue
+			}
+			switch vv := v.(type) {
+			case string:
+				if vv != "" {
+					parts = append(parts, vv)
+				}
+			case []map[string]any:
+				for _, entry := range vv {
+					if s, ok := entry["text"].(string); ok && s != "" {
+						parts = append(parts, s)
+					}
+				}
+			case []any:
+				for _, entry := range vv {
+					if m, ok := entry.(map[string]any); ok {
+						if s, ok := m["text"].(string); ok && s != "" {
+							parts = append(parts, s)
+						}
+					} else if s, ok := entry.(string); ok && s != "" {
+						parts = append(parts, s)
+					}
+				}
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 func messagesToInput(msgs []provider.Message) []map[string]any {
